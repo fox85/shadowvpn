@@ -1,4 +1,4 @@
-name: Build ShadowVPN (musl + HW Accel)
+name: Build ShadowVPN (Rust musl + HW Accel)
 
 on:
   push:
@@ -14,56 +14,46 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: x64
-            arch: x86_64
-            # x86_64 开启 AES-NI 硬件加速
-            hw_cflags: "-maes -mpclmul"
+          - arch: x64
+            target: x86_64-unknown-linux-musl
+            # x86_64 开启 AES-NI 和 PCLMUL 加速
+            rustflags: "-C target-feature=+aes,+pclmul"
             
-          - name: aarch64
-            arch: aarch64
-            # ARMv8 开启 NEON 和 Crypto (AES/SHA) 扩展
-            hw_cflags: "-march=armv8-a+crypto"
+          - arch: aarch64
+            target: aarch64-unknown-linux-musl
+            # AArch64 (ARMv8) 开启 AES 和 NEON 硬件加速（根据 README 推荐）
+            rustflags: "-C target-feature=+aes,+neon"
             
-          - name: armv7
-            arch: armv7
+          - arch: armv7
+            target: armv7-unknown-linux-musleabihf
             # ARMv7 开启 NEON 向量指令集加速
-            hw_cflags: "-mfpu=neon"
+            rustflags: "-C target-feature=+neon"
 
     steps:
       - name: Checkout Source
         uses: actions/checkout@v4
+
+      # 1. 安装对应架构的 Rust musl target
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          repository: madeye/shadowvpn
-          submodules: recursive # 必须递归拉取 libsodium
+          targets: ${{ matrix.target }}
 
-      - name: Build in Alpine (Native musl with HW Crypto)
-        uses: uraimo/run-on-arch-action@v2
+      # 2. 安装 cross (Rust 极速交叉编译工具)
+      - name: Install cross
+        uses: taiki-e/install-action@v2
         with:
-          arch: ${{ matrix.arch }}
-          distro: alpine_latest
-          githubToken: ${{ github.token }}
-          run: |
-            # 1. 安装编译依赖
-            apk update
-            apk add --no-cache build-base autoconf automake libtool linux-headers git file pkgconf
+          tool: cross
 
-            # 2. 生成 configure 脚本
-            ./autogen.sh
+      # 3. 注入 RUSTFLAGS 并使用 cross 进行静态编译
+      - name: Build ShadowVPN
+        run: cross build --release --target ${{ matrix.target }}
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
 
-            # 3. 配置编译参数，注入对应架构的硬件加速 CFLAGS
-            ./configure \
-              --enable-static \
-              CFLAGS="-O3 -static ${{ matrix.hw_cflags }}" \
-              LDFLAGS="-static"
-            
-            # 4. 编译 (ShadowVPN 及其内建的 libsodium 将会以硬件加速模式被编译)
-            make -j$(nproc)
-            
-            # 5. 验证编译产物
-            file src/shadowvpn
-
+      # 4. 上传编译好的纯静态 musl 二进制文件
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: shadowvpn-${{ matrix.name }}-musl
-          path: src/shadowvpn
+          name: shadowvpn-${{ matrix.arch }}-musl
+          path: target/${{ matrix.target }}/release/shadowvpn
