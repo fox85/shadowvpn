@@ -1,96 +1,69 @@
-name: Release
+name: Cross-compile ShadowVPN (musl)
 
-# 触发方式：
-#   - 推送 v* 标签：自动构建并发布到 GitHub Release
-#   - PR / 手动 Run workflow：只做交叉编译验证，上传 artifact，不发布
 on:
   push:
-    tags: ["v*"]
+    branches: [ "master", "main" ]
   pull_request:
-  workflow_dispatch:
-
-permissions:
-  contents: write
-
-env:
-  CARGO_TERM_COLOR: always
-  BIN_NAME: udp-over-tcp
+    branches: [ "master", "main" ]
+  workflow_dispatch: # 允许手动触发工作流
 
 jobs:
   build:
-    name: build (${{ matrix.target }})
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          # 只要这三个架构：x64 / aarch64 / armv7。
-          # 全部静态链接 musl，产物拷到任意 Linux（含 OpenWrt、老旧 glibc 的设备）即可直接跑。
-          - target: x86_64-unknown-linux-musl
-          - target: aarch64-unknown-linux-musl
-          - target: armv7-unknown-linux-musleabihf
-          # 想换成 glibc 动态链接（体积小一点，但依赖目标机 libc 版本）时，
-          # 把上面三行替换成下面这三行，其余配置不用动：
-          # - target: x86_64-unknown-linux-gnu
-          # - target: aarch64-unknown-linux-gnu
-          # - target: armv7-unknown-linux-gnueabihf
+          - arch: x64
+            target: x86_64-linux-musl
+          - arch: aarch64
+            target: aarch64-linux-musl
+          - arch: armv7
+            target: arm-linux-musleabihf
+
     steps:
-      - name: Checkout
+      - name: Checkout Source
         uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
-          targets: ${{ matrix.target }}
+          repository: madeye/shadowvpn
+          # ShadowVPN 依赖 libsodium，必须递归拉取子模块
+          submodules: recursive 
 
-      - name: Cache cargo registry & target dir
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-
-      # cross 用 Docker 容器提供目标架构的 sysroot + 交叉链接器，
-      # GitHub 托管的 Ubuntu runner 自带 Docker，无需额外配置。
-      - name: Install cross
-        uses: taiki-e/install-action@cross
-
-      - name: Show versions
+      - name: Install Build Tools
         run: |
-          rustc --version
-          cross --version
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake libtool build-essential wget tar
 
-      - name: Build
-        env:
-          # 链接时去掉符号表，产物体积通常能小 60%~80%
-          RUSTFLAGS: -C strip=symbols
-        run: cross build --locked --release --target ${{ matrix.target }}
-
-      - name: Package
+      - name: Download and Setup musl.cc Toolchain
         run: |
-          version="${GITHUB_REF_NAME#v}"
-          [ "${version}" = "${GITHUB_REF_NAME}" ] && version="${GITHUB_SHA::7}"
-          pkg="${BIN_NAME}-v${version}-${{ matrix.target }}"
-          mkdir -p "${pkg}"
-          cp "target/${{ matrix.target }}/release/${BIN_NAME}" "${pkg}/"
-          cp README.md LICENSE-MIT LICENSE-APACHE CHANGELOG.md "${pkg}/"
-          tar -czf "${pkg}.tar.gz" "${pkg}"
-          sha256sum "${pkg}.tar.gz" | tee "${pkg}.tar.gz.sha256"
-          echo "PKG=${pkg}" >> "$GITHUB_ENV"
+          # 从 musl.cc 下载对应架构的交叉编译工具链
+          wget https://musl.cc/${{ matrix.target }}-cross.tgz
+          tar -xf ${{ matrix.target }}-cross.tgz
+          # 将工具链的 bin 目录加入环境变量 PATH
+          echo "$GITHUB_WORKSPACE/${{ matrix.target }}-cross/bin" >> $GITHUB_PATH
 
-      - name: Upload artifact
+      - name: Build ShadowVPN
+        run: |
+          # 生成 configure 脚本
+          ./autogen.sh
+          
+          # 配置为静态交叉编译
+          ./configure \
+            --host=${{ matrix.target }} \
+            CC=${{ matrix.target }}-gcc \
+            CXX=${{ matrix.target }}-g++ \
+            --enable-static \
+            CFLAGS="-O2 -static" \
+            LDFLAGS="-static"
+            
+          # 多核编译加速
+          make -j$(nproc)
+          
+          # 检查编译出来的文件信息（可选，方便在 Action 日志中确认）
+          file src/shadowvpn
+
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.BIN_NAME }}-${{ matrix.target }}
-          path: |
-            ${{ env.PKG }}.tar.gz
-            ${{ env.PKG }}.tar.gz.sha256
-          if-no-files-found: error
-
-      - name: Publish to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          draft: false
-          files: |
-            ${{ env.PKG }}.tar.gz
-            ${{ env.PKG }}.tar.gz.sha256
+          name: shadowvpn-${{ matrix.arch }}-musl
+          path: src/shadowvpn
