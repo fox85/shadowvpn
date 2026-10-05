@@ -1,8 +1,8 @@
 name: Release
 
-# 触发方式：
-#   - 推送 v* 标签：自动构建并发布到 GitHub Release
-#   - PR / 手动 Run workflow：只做交叉编译验证，上传 artifact，不发布
+# Push a `v*` tag to build every target and publish the archives to the GitHub
+# Release. Pull requests and manual runs build the same matrix but only upload
+# the artifacts (no release is touched).
 on:
   push:
     tags: ["v*"]
@@ -14,7 +14,6 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  BIN_NAME: shadowvpn
 
 jobs:
   build:
@@ -24,16 +23,30 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # 只要这三个架构：x64 / aarch64 / armv7。
-          # 全部静态链接 musl，产物拷到任意 Linux（含 OpenWrt、老旧 glibc 的设备）即可直接跑。
+          # x64 / aarch64 / armv7, statically linked against musl so the archive
+          # runs on any Linux (routers, old glibc, containers) with no runtime deps.
+          #
+          # `rustflags` enables the CPU features the AEAD ciphers need:
+          #
+          # * aarch64 — +aes,+neon. Without `+aes` the `aes` crate falls back to
+          #   a software table implementation, which is several times slower than
+          #   the ARMv8 crypto instructions; ChaCha20-Poly1305 benefits from
+          #   `+neon`. (Caveat: AES is an *optional* ARMv8-A extension. Verify
+          #   your devices have it — `grep -m1 aes /proc/cpuinfo` — or drop
+          #   `+aes` to stay portable.)
+          # * armv7 — left at the default. 32-bit ARM AES is rarer and the
+          #   target covers everything from a Pi 2 to a modern router; add
+          #   `-C target-feature=+aes,+neon` here only if every device you ship
+          #   to supports it.
+          # * x86_64 — nothing needed. The `aes` crate detects AES-NI at
+          #   *runtime* on x86, so a portable build still uses it when present.
+          #   (Use `-C target-cpu=native` for local builds on the target box.)
           - target: x86_64-unknown-linux-musl
+            rustflags: ""
           - target: aarch64-unknown-linux-musl
+            rustflags: "-C target-feature=+aes,+neon"
           - target: armv7-unknown-linux-musleabihf
-          # 想换成 glibc 动态链接（体积小一点，但依赖目标机 libc 版本）时，
-          # 把上面三行替换成下面这三行，其余配置不用动：
-          # - target: x86_64-unknown-linux-gnu
-          # - target: aarch64-unknown-linux-gnu
-          # - target: armv7-unknown-linux-gnueabihf
+            rustflags: ""
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -49,30 +62,40 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      # cross 用 Docker 容器提供目标架构的 sysroot + 交叉链接器，
-      # GitHub 托管的 Ubuntu runner 自带 Docker，无需额外配置。
+      # cross provides the target sysroot + cross linker in a Docker image;
+      # GitHub-hosted Ubuntu runners already have Docker.
       - name: Install cross
         uses: taiki-e/install-action@cross
 
-      - name: Show versions
-        run: |
-          rustc --version
-          cross --version
-
       - name: Build
         env:
-          # 链接时去掉符号表，产物体积通常能小 60%~80%
-          RUSTFLAGS: -C strip=symbols
+          # NOTE: setting the RUSTFLAGS *env var* overrides any rustflags in
+          # .cargo/config.toml, so the per-target features must be listed here.
+          RUSTFLAGS: -C strip=symbols ${{ matrix.rustflags }}
         run: cross build --locked --release --target ${{ matrix.target }}
 
       - name: Package
         run: |
+          set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
           [ "${version}" = "${GITHUB_REF_NAME}" ] && version="${GITHUB_SHA::7}"
-          pkg="${BIN_NAME}-v${version}-${{ matrix.target }}"
+          pkg="shadowvpn-${version}-${{ matrix.target }}"
           mkdir -p "${pkg}"
-          cp "target/${{ matrix.target }}/release/${BIN_NAME}" "${pkg}/"
-          cp README.md LICENSE-MIT LICENSE-APACHE CHANGELOG.md "${pkg}/"
+
+          # Binaries are mandatory; docs are optional so a trimmed repo (or a
+          # fork without every top-level file) still produces an archive.
+          for b in shadowvpn-server shadowvpn-client; do
+            src="target/${{ matrix.target }}/release/${b}"
+            if [ ! -f "${src}" ]; then
+              echo "::error::missing build output ${src}"
+              exit 1
+            fi
+            cp "${src}" "${pkg}/"
+          done
+          for f in README.md LICENSE CHANGES.md docs/reference/configuration.md; do
+            [ -f "${f}" ] && cp "${f}" "${pkg}/" || echo "skipping optional file ${f}"
+          done
+
           tar -czf "${pkg}.tar.gz" "${pkg}"
           sha256sum "${pkg}.tar.gz" | tee "${pkg}.tar.gz.sha256"
           echo "PKG=${pkg}" >> "$GITHUB_ENV"
@@ -80,7 +103,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.BIN_NAME }}-${{ matrix.target }}
+          name: shadowvpn-${{ matrix.target }}
           path: |
             ${{ env.PKG }}.tar.gz
             ${{ env.PKG }}.tar.gz.sha256
