@@ -1,119 +1,69 @@
-name: Release
+name: Build ShadowVPN (musl + HW Accel)
 
-# Push a `v*` tag to build every target and publish the archives to the GitHub
-# Release. Pull requests and manual runs build the same matrix but only upload
-# the artifacts (no release is touched).
 on:
   push:
-    tags: ["v*"]
+    branches: [ "master", "main" ]
   pull_request:
+    branches: [ "master", "main" ]
   workflow_dispatch:
-
-permissions:
-  contents: write
-
-env:
-  CARGO_TERM_COLOR: always
 
 jobs:
   build:
-    name: build (${{ matrix.target }})
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          # x64 / aarch64 / armv7, statically linked against musl so the archive
-          # runs on any Linux (routers, old glibc, containers) with no runtime deps.
-          #
-          # `rustflags` enables the CPU features the AEAD ciphers need:
-          #
-          # * aarch64 — +aes,+neon. Without `+aes` the `aes` crate falls back to
-          #   a software table implementation, which is several times slower than
-          #   the ARMv8 crypto instructions; ChaCha20-Poly1305 benefits from
-          #   `+neon`. (Caveat: AES is an *optional* ARMv8-A extension. Verify
-          #   your devices have it — `grep -m1 aes /proc/cpuinfo` — or drop
-          #   `+aes` to stay portable.)
-          # * armv7 — left at the default. 32-bit ARM AES is rarer and the
-          #   target covers everything from a Pi 2 to a modern router; add
-          #   `-C target-feature=+aes,+neon` here only if every device you ship
-          #   to supports it.
-          # * x86_64 — nothing needed. The `aes` crate detects AES-NI at
-          #   *runtime* on x86, so a portable build still uses it when present.
-          #   (Use `-C target-cpu=native` for local builds on the target box.)
-          - target: x86_64-unknown-linux-musl
-            rustflags: ""
-          - target: aarch64-unknown-linux-musl
-            rustflags: "-C target-feature=+aes,+neon"
-          - target: armv7-unknown-linux-musleabihf
-            rustflags: ""
+          - name: x64
+            arch: x86_64
+            # x86_64 开启 AES-NI 硬件加速
+            hw_cflags: "-maes -mpclmul"
+            
+          - name: aarch64
+            arch: aarch64
+            # ARMv8 开启 NEON 和 Crypto (AES/SHA) 扩展
+            hw_cflags: "-march=armv8-a+crypto"
+            
+          - name: armv7
+            arch: armv7
+            # ARMv7 开启 NEON 向量指令集加速
+            hw_cflags: "-mfpu=neon"
+
     steps:
-      - name: Checkout
+      - name: Checkout Source
         uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
-          targets: ${{ matrix.target }}
+          repository: madeye/shadowvpn
+          submodules: recursive # 必须递归拉取 libsodium
 
-      - name: Cache cargo registry & target dir
-        uses: Swatinem/rust-cache@v2
+      - name: Build in Alpine (Native musl with HW Crypto)
+        uses: uraimo/run-on-arch-action@v2
         with:
-          key: ${{ matrix.target }}
+          arch: ${{ matrix.arch }}
+          distro: alpine_latest
+          githubToken: ${{ github.token }}
+          run: |
+            # 1. 安装编译依赖
+            apk update
+            apk add --no-cache build-base autoconf automake libtool linux-headers git file pkgconf
 
-      # cross provides the target sysroot + cross linker in a Docker image;
-      # GitHub-hosted Ubuntu runners already have Docker.
-      - name: Install cross
-        uses: taiki-e/install-action@cross
+            # 2. 生成 configure 脚本
+            ./autogen.sh
 
-      - name: Build
-        env:
-          # NOTE: setting the RUSTFLAGS *env var* overrides any rustflags in
-          # .cargo/config.toml, so the per-target features must be listed here.
-          RUSTFLAGS: -C strip=symbols ${{ matrix.rustflags }}
-        run: cross build --locked --release --target ${{ matrix.target }}
+            # 3. 配置编译参数，注入对应架构的硬件加速 CFLAGS
+            ./configure \
+              --enable-static \
+              CFLAGS="-O3 -static ${{ matrix.hw_cflags }}" \
+              LDFLAGS="-static"
+            
+            # 4. 编译 (ShadowVPN 及其内建的 libsodium 将会以硬件加速模式被编译)
+            make -j$(nproc)
+            
+            # 5. 验证编译产物
+            file src/shadowvpn
 
-      - name: Package
-        run: |
-          set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          [ "${version}" = "${GITHUB_REF_NAME}" ] && version="${GITHUB_SHA::7}"
-          pkg="shadowvpn-${version}-${{ matrix.target }}"
-          mkdir -p "${pkg}"
-
-          # Binaries are mandatory; docs are optional so a trimmed repo (or a
-          # fork without every top-level file) still produces an archive.
-          for b in shadowvpn-server shadowvpn-client; do
-            src="target/${{ matrix.target }}/release/${b}"
-            if [ ! -f "${src}" ]; then
-              echo "::error::missing build output ${src}"
-              exit 1
-            fi
-            cp "${src}" "${pkg}/"
-          done
-          for f in README.md LICENSE CHANGES.md docs/reference/configuration.md; do
-            [ -f "${f}" ] && cp "${f}" "${pkg}/" || echo "skipping optional file ${f}"
-          done
-
-          tar -czf "${pkg}.tar.gz" "${pkg}"
-          sha256sum "${pkg}.tar.gz" | tee "${pkg}.tar.gz.sha256"
-          echo "PKG=${pkg}" >> "$GITHUB_ENV"
-
-      - name: Upload artifact
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: shadowvpn-${{ matrix.target }}
-          path: |
-            ${{ env.PKG }}.tar.gz
-            ${{ env.PKG }}.tar.gz.sha256
-          if-no-files-found: error
-
-      - name: Publish to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          draft: false
-          files: |
-            ${{ env.PKG }}.tar.gz
-            ${{ env.PKG }}.tar.gz.sha256
+          name: shadowvpn-${{ matrix.name }}-musl
+          path: src/shadowvpn
